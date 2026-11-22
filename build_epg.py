@@ -30,19 +30,18 @@ def attr(line, key):
     return m.group(1) if m else ''
 
 def normalize(s):
-    """Conservative channel-name key; strip technical annotations, not channel numbers."""
+    """Conservative channel-name key; remove technical labels."""
     s = (s or '').casefold().replace('&', ' and ')
-    s = re.sub(r'\\([^)]*\\)', ' ', s) if False else s
-    s = re.sub(r'\\((?:\\d{3,4}p|4k|uhd|fhd|hd|sd|united states|usa)\\)', ' ', s)
-    s = re.sub(r'\\[(?:geo-blocked|not 24/7|offline|\\d{3,4}p)\\]', ' ', s)
-    s = re.sub(r'\\b(?:uhd|fhd|hd|sd|4k)\\b', ' ', s)
+    s = re.sub(r'\((?:\d{3,4}p|4k|uhd|fhd|hd|sd|united states|usa)\)', ' ', s)
+    s = re.sub(r'\[(?:geo-blocked|not 24/7|offline|\d{3,4}p)\]', ' ', s)
+    s = re.sub(r'\b(?:uhd|fhd|hd|sd|4k)\b', ' ', s)
     return re.sub(r'[^a-z0-9]+', '', s)
 
 def id_keys(raw):
-    """Keys for an IPTV-org stream ID or an XMLTV channel ID."""
+    """Use both the full ID and its stream/region-stripped variant."""
     raw = (raw or '').split('@', 1)[0]
     keys = {normalize(raw)}
-    raw = re.sub(r'\\.us2?$', '', raw, flags=re.I)
+    raw = re.sub(r'\.us2?$', '', raw, flags=re.I)
     keys.add(normalize(raw))
     return {k for k in keys if k}
 
