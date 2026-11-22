@@ -31,6 +31,7 @@ jobs:
           path: |
             site/id_samples.csv
             site/coverage.csv
+            site/candidates.csv
             site/summary.txt
           if-no-files-found: warn
           retention-days: 14
