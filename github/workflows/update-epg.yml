@@ -23,9 +23,23 @@ jobs:
           python-version: '3.12'
       - name: Generate guide and coverage report
         run: python build_epg.py
+      - name: Upload diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iptv-epg-diagnostics
+          path: |
+            site/id_samples.csv
+            site/coverage.csv
+            site/summary.txt
+          if-no-files-found: warn
+          retention-days: 14
       - uses: actions/configure-pages@v5
+        if: success()
       - uses: actions/upload-pages-artifact@v3
+        if: success()
         with:
           path: site
       - id: deployment
         uses: actions/deploy-pages@v4
+        if: success()
