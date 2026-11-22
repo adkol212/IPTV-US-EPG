@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""IPTV-org US XMLTV matching audit and conservative EPG publisher (V2)."""
+"""IPTV-org US XMLTV conservative channel matcher (V4)."""
 import copy
 import csv
 import gzip
@@ -17,7 +17,7 @@ SOURCES = [
     ('EPGpw_US', 'https://epg.pw/xmltv/epg_US.xml.gz'),
 ]
 OUT = Path(os.getenv('OUTPUT_DIR', 'site'))
-HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; IPTV-US-EPG/3.0)'}
+HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; IPTV-US-EPG/4.0)'}
 
 def download(url):
     req = urllib.request.Request(url, headers=HEADERS)
@@ -30,9 +30,24 @@ def attr(line, key):
     return m.group(1) if m else ''
 
 def normalize(s):
-    s = s.casefold().replace('&', ' and ')
-    s = re.sub(r'\b(?:hd|fhd|uhd|4k|usa|us|tv|channel)\b', ' ', s)
+    """Conservative channel-name key; strip technical annotations, not channel numbers."""
+    s = (s or '').casefold().replace('&', ' and ')
+    s = re.sub(r'\\([^)]*\\)', ' ', s) if False else s
+    s = re.sub(r'\\((?:\\d{3,4}p|4k|uhd|fhd|hd|sd|united states|usa)\\)', ' ', s)
+    s = re.sub(r'\\[(?:geo-blocked|not 24/7|offline|\\d{3,4}p)\\]', ' ', s)
+    s = re.sub(r'\\b(?:uhd|fhd|hd|sd|4k)\\b', ' ', s)
     return re.sub(r'[^a-z0-9]+', '', s)
+
+def id_keys(raw):
+    """Keys for an IPTV-org stream ID or an XMLTV channel ID."""
+    raw = (raw or '').split('@', 1)[0]
+    keys = {normalize(raw)}
+    raw = re.sub(r'\\.us2?$', '', raw, flags=re.I)
+    keys.add(normalize(raw))
+    return {k for k in keys if k}
+
+def name_keys(ch):
+    return {normalize(x) for x in (ch['name'], ch['display']) if normalize(x)}
 
 def playlist_channels(data):
     channels = []
@@ -60,7 +75,8 @@ def load_sources():
                 if not cid:
                     continue
                 ids[cid] = ch
-                normalized_ids[normalize(cid)].add(cid)
+                for key in id_keys(cid):
+                    normalized_ids[key].add(cid)
                 for el in ch.findall('display-name'):
                     if el.text and normalize(el.text):
                         names[normalize(el.text)].add(cid)
@@ -76,17 +92,17 @@ def load_sources():
     return loaded
 
 def candidates(ch, sources):
+    """Return high-confidence matches only; avoid ambiguous source channel choices."""
     results = []
     pid = ch['id']
     for src in sources:
         hits = []
         if pid and pid in src['ids']:
             hits.append((0, pid, 'exact_id'))
-        if pid and normalize(pid):
-            hits.extend((1, cid, 'normalized_id') for cid in src['normalized_ids'][normalize(pid)])
-        for value in (ch['name'], ch['display']):
-            if normalize(value):
-                hits.extend((2, cid, 'unique_name') for cid in src['names'][normalize(value)])
+        for key in id_keys(pid):
+            hits.extend((1, cid, 'normalized_id') for cid in src['normalized_ids'].get(key, ()))
+        for key in name_keys(ch):
+            hits.extend((2, cid, 'normalized_name') for cid in src['names'].get(key, ()))
         for rank, cid, method in hits:
             if src['programmes'].get(cid):
                 results.append((rank, src['label'], cid, method, src['programmes'][cid]))
@@ -95,7 +111,7 @@ def candidates(ch, sources):
         key = (hit[1], hit[2])
         if key not in unique or hit[0] < unique[key][0]:
             unique[key] = hit
-    return sorted(unique.values(), key=lambda x: (x[0], -len(x[4]), x[1], x[2]))
+    return sorted(unique.values(), key=lambda x: (x[0], SOURCES.index(next(s for s in SOURCES if s[0] == x[1])), x[2]))
 
 def write_id_audit(channels, sources):
     """Write raw IDs and display names before attempting any matching."""
@@ -124,8 +140,9 @@ def main():
     sources = load_sources()
     write_id_audit(channels, sources)
     print(f'Playlist entries: {len(channels)}; entries without tvg-id: {sum(not c["id"] for c in channels)}', flush=True)
-    root = ET.Element('tv', {'generator-info-name': 'IPTV-US-EPG V2; real programmes only'})
+    root = ET.Element('tv', {'generator-info-name': 'IPTV-US-EPG V4; real programmes only'})
     audit = []
+    candidates_audit = []
     emitted_ids = set()
     matched_ids = set()
     programme_signatures = set()
@@ -134,10 +151,18 @@ def main():
         pid = ch['id']
         hits = candidates(ch, sources)
         best = [x for x in hits if x[0] == hits[0][0]] if hits else []
-        # Two providers may describe the same channel under different IDs.
-        # For name-only matches, require a single unique source ID across providers.
-        ambiguous = len({x[2] for x in best}) > 1 and best[0][0] == 2 if best else False
-        chosen = best[0] if best and not ambiguous else None
+        for hit in hits[:10]:
+            candidates_audit.append({'playlist_id': pid, 'playlist_name': ch['name'],
+                                     'rank': hit[0], 'provider': hit[1],
+                                     'provider_id': hit[2], 'method': hit[3]})
+        # Distinct channel IDs within the SAME source at the best rank are ambiguous.
+        # A single channel in each of two providers is not itself ambiguous.
+        best_by_source = defaultdict(set)
+        for hit in best:
+            best_by_source[hit[1]].add(hit[2])
+        unambiguous_sources = {label for label, ids in best_by_source.items() if len(ids) == 1}
+        ambiguous = bool(best) and not unambiguous_sources
+        chosen = next((hit for hit in best if hit[1] in unambiguous_sources), None)
         status = ('missing_playlist_id' if not pid else 'unmatched')
         if ambiguous:
             status = 'ambiguous_name'
@@ -173,6 +198,10 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(audit)
+    with (OUT / 'candidates.csv').open('w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.DictWriter(f, fieldnames=['playlist_id','playlist_name','rank','provider','provider_id','method'])
+        writer.writeheader()
+        writer.writerows(candidates_audit)
     counts = Counter(row['status'] for row in audit)
     summary = (f'Playlist entries: {len(channels)}\n'
                f'Entries without tvg-id: {sum(not c["id"] for c in channels)}\n'
