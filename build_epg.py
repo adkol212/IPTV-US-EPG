@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Build a conservative XMLTV guide matching IPTV-org's US playlist.
-Only genuine upstream programme entries are copied; no synthetic schedules.
-"""
+"""IPTV-org US XMLTV matching audit and conservative EPG publisher (V2)."""
+import copy
 import csv
 import gzip
-import io
 import os
 import re
 import sys
 import urllib.request
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import defaultdict, Counter
 from pathlib import Path
 
 PLAYLIST = os.getenv('PLAYLIST_URL', 'https://iptv-org.github.io/iptv/countries/us.m3u')
@@ -19,19 +17,17 @@ SOURCES = [
     ('EPGpw_US', 'https://epg.pw/xmltv/epg_US.xml.gz'),
 ]
 OUT = Path(os.getenv('OUTPUT_DIR', 'site'))
-HEADERS = {'User-Agent': 'IPTV-US-EPG/1.0 (+personal XMLTV channel audit)'}
+HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; IPTV-US-EPG/2.0)'}
 
 def download(url):
-    request = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(request, timeout=150) as r:
-        data = r.read()
-    if data[:2] == b'\x1f\x8b':
-        data = gzip.decompress(data)
-    return data
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=180) as response:
+        data = response.read()
+    return gzip.decompress(data) if data.startswith(b'\x1f\x8b') else data
 
 def attr(line, key):
-    match = re.search(r'(?<!\S)' + re.escape(key) + r'="([^"]*)"', line)
-    return match.group(1) if match else ''
+    m = re.search(r'(?<!\S)' + re.escape(key) + r'="([^"]*)"', line)
+    return m.group(1) if m else ''
 
 def normalize(s):
     s = s.casefold().replace('&', ' and ')
@@ -39,129 +35,140 @@ def normalize(s):
     return re.sub(r'[^a-z0-9]+', '', s)
 
 def playlist_channels(data):
-    result = {}
+    channels = []
     for line in data.decode('utf-8-sig', errors='replace').splitlines():
-        if not line.startswith('#EXTINF:'):
-            continue
-        cid = attr(line, 'tvg-id')
-        name = attr(line, 'tvg-name') or line.split(',', 1)[-1].strip()
-        if not cid:
-            # No stable id means TiviMate matching is unreliable; audit but don't guess.
-            cid = ''
-        key = cid or 'NO_ID:' + name
-        result.setdefault(key, {'id': cid, 'name': name, 'logo': attr(line, 'tvg-logo')})
-    return list(result.values())
+        if line.startswith('#EXTINF:'):
+            display = line.split(',', 1)[-1].strip()
+            channels.append({'id': attr(line, 'tvg-id').strip(),
+                             'name': (attr(line, 'tvg-name') or display).strip(),
+                             'display': display,
+                             'logo': attr(line, 'tvg-logo')})
+    return channels
 
-def get_sources():
+def load_sources():
     loaded = []
     for label, url in SOURCES:
         try:
             root = ET.fromstring(download(url))
             if root.tag != 'tv':
-                raise ValueError('Not an XMLTV <tv> document')
+                raise ValueError('XMLTV root is not <tv>')
             ids = {}
             names = defaultdict(set)
-            for c in root.findall('channel'):
-                cid = c.get('id', '')
+            normalized_ids = defaultdict(set)
+            for ch in root.findall('channel'):
+                cid = ch.get('id', '')
                 if not cid:
                     continue
-                ids[cid] = c
-                for el in c.findall('display-name'):
+                ids[cid] = ch
+                normalized_ids[normalize(cid)].add(cid)
+                for el in ch.findall('display-name'):
                     if el.text and normalize(el.text):
                         names[normalize(el.text)].add(cid)
             programmes = defaultdict(list)
             for p in root.findall('programme'):
                 if p.get('channel'):
                     programmes[p.get('channel')].append(p)
-            loaded.append((label, ids, names, programmes))
-            print(f'{label}: {len(ids)} channels, {sum(map(len, programmes.values()))} programmes')
+            loaded.append({'label': label, 'ids': ids, 'names': names,
+                           'normalized_ids': normalized_ids, 'programmes': programmes})
+            print(f'{label}: {len(ids)} channels, {sum(map(len, programmes.values()))} programmes', flush=True)
         except Exception as exc:
-            print(f'WARNING: {label} unavailable: {exc}', file=sys.stderr)
-    if not loaded:
-        raise RuntimeError('All guide downloads failed; refusing to publish empty EPG')
+            print(f'WARNING: {label}: {exc}', file=sys.stderr, flush=True)
     return loaded
 
+def candidates(ch, sources):
+    results = []
+    pid = ch['id']
+    for src in sources:
+        hits = []
+        if pid and pid in src['ids']:
+            hits.append((0, pid, 'exact_id'))
+        if pid and normalize(pid):
+            hits.extend((1, cid, 'normalized_id') for cid in src['normalized_ids'][normalize(pid)])
+        for value in (ch['name'], ch['display']):
+            if normalize(value):
+                hits.extend((2, cid, 'unique_name') for cid in src['names'][normalize(value)])
+        for rank, cid, method in hits:
+            if src['programmes'].get(cid):
+                results.append((rank, src['label'], cid, method, src['programmes'][cid]))
+    unique = {}
+    for hit in results:
+        key = (hit[1], hit[2])
+        if key not in unique or hit[0] < unique[key][0]:
+            unique[key] = hit
+    return sorted(unique.values(), key=lambda x: (x[0], -len(x[4]), x[1], x[2]))
+
 def main():
+    OUT.mkdir(parents=True, exist_ok=True)
     channels = playlist_channels(download(PLAYLIST))
-    sources = get_sources()
-    root = ET.Element('tv', {'generator-info-name': 'IPTV-US-EPG (real programmes only)'})
+    sources = load_sources()
+    print(f'Playlist entries: {len(channels)}; entries without tvg-id: {sum(not c["id"] for c in channels)}', flush=True)
+    root = ET.Element('tv', {'generator-info-name': 'IPTV-US-EPG V2; real programmes only'})
     audit = []
-    total_programmes = 0
+    emitted_ids = set()
+    matched_ids = set()
+    programme_signatures = set()
+    total = 0
     for ch in channels:
-        pid, pname = ch['id'], ch['name']
-        matches = []
-        if pid:
-            # Priority 1: literal channel ID; priority 2: unique normalized ID;
-            # priority 3: unique normalized channel name. Never fuzzy auto-match.
-            for label, ids, names, programmes in sources:
-                if pid in ids and programmes.get(pid):
-                    matches.append((0, label, pid, programmes[pid], 'exact_id'))
-                else:
-                    norm_id = normalize(pid)
-                    by_id = [x for x in ids if normalize(x) == norm_id] if norm_id else []
-                    if len(by_id) == 1 and programmes.get(by_id[0]):
-                        matches.append((1, label, by_id[0], programmes[by_id[0]], 'normalized_id'))
-                    elif normalize(pname):
-                        by_name = names.get(normalize(pname), set())
-                        if len(by_name) == 1:
-                            found = next(iter(by_name))
-                            if programmes.get(found):
-                                matches.append((2, label, found, programmes[found], 'unique_name'))
-        # A candidate is accepted only if its best-ranked mapping is unambiguous
-        # across providers. Multiple providers with different IDs for a name are
-        # reported as ambiguous rather than silently choosing one.
-        matches.sort(key=lambda x: (x[0], -len(x[3])))
-        chosen = None
-        status = 'unmatched'
-        if matches:
-            best_rank = matches[0][0]
-            best = [m for m in matches if m[0] == best_rank]
-            if best_rank == 2 and len({m[2] for m in best}) > 1:
-                status = 'ambiguous_name'
-            else:
-                chosen = best[0]
-                status = chosen[4]
+        pid = ch['id']
+        hits = candidates(ch, sources)
+        best = [x for x in hits if x[0] == hits[0][0]] if hits else []
+        # Two providers may describe the same channel under different IDs.
+        # For name-only matches, require a single unique source ID across providers.
+        ambiguous = len({x[2] for x in best}) > 1 and best[0][0] == 2 if best else False
+        chosen = best[0] if best and not ambiguous else None
+        status = ('missing_playlist_id' if not pid else 'unmatched')
+        if ambiguous:
+            status = 'ambiguous_name'
+        elif chosen and not pid:
+            status = 'candidate_missing_playlist_id'
+        elif chosen:
+            status = chosen[3]
         count = 0
-        if chosen:
-            _, label, source_id, programmes, method = chosen
+        if chosen and pid and pid not in emitted_ids:
+            emitted_ids.add(pid)
+            matched_ids.add(pid)
             c = ET.SubElement(root, 'channel', {'id': pid})
-            ET.SubElement(c, 'display-name').text = pname
+            ET.SubElement(c, 'display-name').text = ch['name']
             if ch['logo']:
                 ET.SubElement(c, 'icon', {'src': ch['logo']})
-            seen = set()
-            for p in programmes:
-                signature = (p.get('start'), p.get('stop'), ''.join(p.findtext('title', default='')))
-                if signature in seen:
+            for p in chosen[4]:
+                signature = (pid, p.get('start'), p.get('stop'), p.findtext('title', default=''))
+                if signature in programme_signatures:
                     continue
-                seen.add(signature)
-                # Preserve original programme metadata, reassign to playlist id.
-                import copy
+                programme_signatures.add(signature)
                 item = copy.deepcopy(p)
                 item.set('channel', pid)
                 root.append(item)
                 count += 1
-            total_programmes += count
-        audit.append({'playlist_id': pid, 'playlist_name': pname,
-                      'status': status, 'source': chosen[1] if chosen else '',
-                      'source_id': chosen[2] if chosen else '', 'programmes': count})
-    OUT.mkdir(parents=True, exist_ok=True)
+            total += count
+        audit.append({'playlist_id': pid, 'playlist_name': ch['name'], 'status': status,
+                      'source': chosen[1] if chosen else '',
+                      'source_id': chosen[2] if chosen else '',
+                      'programmes': count,
+                      'candidate_count': len(hits)})
+    fields = ['playlist_id', 'playlist_name', 'status', 'source', 'source_id', 'programmes', 'candidate_count']
     with (OUT / 'coverage.csv').open('w', newline='', encoding='utf-8-sig') as f:
-        writer = csv.DictWriter(f, fieldnames=list(audit[0]) if audit else ['playlist_id','playlist_name','status','source','source_id','programmes'])
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(audit)
-    if not total_programmes:
-        raise RuntimeError('No programmes matched: refusing to publish empty EPG')
+    counts = Counter(row['status'] for row in audit)
+    summary = (f'Playlist entries: {len(channels)}\n'
+               f'Entries without tvg-id: {sum(not c["id"] for c in channels)}\n'
+               f'Unique matched playlist IDs: {len(matched_ids)}\n'
+               f'Real programmes: {total}\n'
+               f'Sources loaded: {len(sources)}/{len(SOURCES)}\n\n'
+               + 'Match status counts:\n'
+               + ''.join(f'  {key}: {value}\n' for key, value in sorted(counts.items())))
+    (OUT / 'summary.txt').write_text(summary, encoding='utf-8')
+    (OUT / 'index.html').write_text('<!doctype html><meta charset="utf-8"><title>IPTV-US-EPG</title><h1>IPTV-US-EPG</h1><p><a href="epg.xml.gz">Guide</a> | <a href="coverage.csv">Coverage CSV</a> | <a href="summary.txt">Summary</a></p>', encoding='utf-8')
+    print(summary, flush=True)
+    if not total:
+        print('WARNING: No matched programmes. Audit files were generated; empty EPG will not be published.', file=sys.stderr)
+        raise RuntimeError('No programmes matched; see summary.txt and coverage.csv in workflow artifacts')
     xml = ET.tostring(root, encoding='utf-8', xml_declaration=True)
     (OUT / 'epg.xml').write_bytes(xml)
     with gzip.open(OUT / 'epg.xml.gz', 'wb', compresslevel=6) as f:
         f.write(xml)
-    matched = sum(bool(a['programmes']) for a in audit)
-    summary = (f'Playlist channels: {len(channels)}\nMatched channels: {matched}\n'
-               f'Unmatched channels: {len(channels)-matched}\nReal programmes: {total_programmes}\n'
-               f'Sources loaded: {len(sources)}/{len(SOURCES)}\n')
-    (OUT / 'summary.txt').write_text(summary, encoding='utf-8')
-    (OUT / 'index.html').write_text('<!doctype html><meta charset="utf-8"><title>IPTV-US-EPG</title><h1>IPTV-US-EPG</h1><p><a href="epg.xml.gz">EPG download</a> · <a href="coverage.csv">Coverage audit</a> · <a href="summary.txt">Summary</a></p>', encoding='utf-8')
-    print(summary)
 
 if __name__ == '__main__':
     main()
