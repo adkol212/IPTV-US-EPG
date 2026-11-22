@@ -17,7 +17,7 @@ SOURCES = [
     ('EPGpw_US', 'https://epg.pw/xmltv/epg_US.xml.gz'),
 ]
 OUT = Path(os.getenv('OUTPUT_DIR', 'site'))
-HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; IPTV-US-EPG/2.0)'}
+HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; IPTV-US-EPG/3.0)'}
 
 def download(url):
     req = urllib.request.Request(url, headers=HEADERS)
@@ -97,10 +97,32 @@ def candidates(ch, sources):
             unique[key] = hit
     return sorted(unique.values(), key=lambda x: (x[0], -len(x[4]), x[1], x[2]))
 
+def write_id_audit(channels, sources):
+    """Write raw IDs and display names before attempting any matching."""
+    rows = []
+    for ch in channels[:15]:
+        rows.append({'source': 'PLAYLIST', 'channel_id': ch['id'],
+                     'display_name': ch['display'], 'tvg_name': ch['name']})
+    for src in sources:
+        for cid, node in list(src['ids'].items())[:15]:
+            rows.append({'source': src['label'], 'channel_id': cid,
+                         'display_name': ' | '.join((el.text or '').strip()
+                             for el in node.findall('display-name') if el.text)[:250],
+                         'tvg_name': ''})
+    with (OUT / 'id_samples.csv').open('w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.DictWriter(f, fieldnames=['source', 'channel_id', 'display_name', 'tvg_name'])
+        writer.writeheader()
+        writer.writerows(rows)
+    print('\n=== CHANNEL ID AUDIT (first 15 from each source) ===', flush=True)
+    for row in rows:
+        print(f"{row['source']}: ID={row['channel_id']!r}; name={row['display_name']!r}", flush=True)
+    print('=== END ID AUDIT ===\n', flush=True)
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     channels = playlist_channels(download(PLAYLIST))
     sources = load_sources()
+    write_id_audit(channels, sources)
     print(f'Playlist entries: {len(channels)}; entries without tvg-id: {sum(not c["id"] for c in channels)}', flush=True)
     root = ET.Element('tv', {'generator-info-name': 'IPTV-US-EPG V2; real programmes only'})
     audit = []
@@ -163,8 +185,8 @@ def main():
     (OUT / 'index.html').write_text('<!doctype html><meta charset="utf-8"><title>IPTV-US-EPG</title><h1>IPTV-US-EPG</h1><p><a href="epg.xml.gz">Guide</a> | <a href="coverage.csv">Coverage CSV</a> | <a href="summary.txt">Summary</a></p>', encoding='utf-8')
     print(summary, flush=True)
     if not total:
-        print('WARNING: No matched programmes. Audit files were generated; empty EPG will not be published.', file=sys.stderr)
-        raise RuntimeError('No programmes matched; see summary.txt and coverage.csv in workflow artifacts')
+        print('WARNING: No matched programmes. Diagnostics will be uploaded; no empty EPG will be published.', file=sys.stderr, flush=True)
+        raise RuntimeError('No programmes matched; download the iptv-epg-diagnostics artifact (id_samples.csv, coverage.csv, summary.txt)')
     xml = ET.tostring(root, encoding='utf-8', xml_declaration=True)
     (OUT / 'epg.xml').write_bytes(xml)
     with gzip.open(OUT / 'epg.xml.gz', 'wb', compresslevel=6) as f:
